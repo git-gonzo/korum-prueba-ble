@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prueba BLE Korum</title>
+<style>
+  :root { --fondo:#15131a; --panel:#211e28; --texto:#ece7f2; --tenue:#9a93a6; --oro:#d9b45a; --bien:#6cc48a; --mal:#e06c6c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--fondo); color:var(--texto); font:16px/1.4 system-ui, sans-serif; padding:16px; }
+  h1 { font-size:20px; margin:0 0 4px; color:var(--oro); }
+  p.sub { margin:0 0 16px; color:var(--tenue); font-size:14px; }
+  .fila { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+  button { background:var(--panel); color:var(--texto); border:1px solid #3a3446; border-radius:8px; padding:10px 14px; font:inherit; cursor:pointer; }
+  button.grande { background:var(--oro); color:#1a1407; border:none; font-weight:600; }
+  button:disabled { opacity:.4; cursor:default; }
+  .datos { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:8px; margin-bottom:12px; }
+  .dato { background:var(--panel); border-radius:8px; padding:10px; }
+  .dato b { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
+  .dato span { color:var(--tenue); font-size:13px; }
+  #log { background:#0d0c10; border-radius:8px; padding:10px; height:260px; overflow:auto; font:13px/1.35 ui-monospace, Consolas, monospace; white-space:pre-wrap; }
+  .ok { color:var(--bien); } .err { color:var(--mal); }
+  #aviso { display:none; background:#3a1d1d; color:#ffd5d5; padding:10px; border-radius:8px; margin-bottom:12px; }
+</style>
+</head>
+<body>
+<h1>Prueba BLE del cerebro</h1>
+<p class="sub">La página sale de aquí (luego, de GitHub); con el cerebro solo se cruzan mensajes por Bluetooth.</p>
+<div id="aviso"></div>
+
+<div class="fila">
+  <button class="grande" id="bConectar">Conectar con Korum</button>
+  <button id="bDesc" disabled>Desconectar</button>
+</div>
+
+<div class="datos">
+  <div class="dato"><b id="dEstado">—</b><span>estado</span></div>
+  <div class="dato"><b id="dConex">—</b><span>conexiones en el cerebro</span></div>
+  <div class="dato"><b id="dPing">—</b><span>ping (ida y vuelta)</span></div>
+  <div class="dato"><b id="dCaudal">—</b><span>caudal cerebro → página</span></div>
+</div>
+
+<div class="fila">
+  <button id="bPing" disabled>Ping ×50</button>
+  <button id="bRafaga" disabled>Ráfaga 200 × 180 B</button>
+  <button data-b="A" disabled>Botón A</button>
+  <button data-b="B" disabled>Botón B</button>
+  <button data-b="Menu" disabled>Menú</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+const SERV   = '6b6f7275-6d00-4000-8000-000000000001';
+const ESTADO = '6b6f7275-6d00-4000-8000-000000000002';
+const ORDEN  = '6b6f7275-6d00-4000-8000-000000000003';
+
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+let disp = null, chOrden = null;
+let pingEspera = null;           // {n, t0, resolver}
+let rafaga = null;               // {pedidos, recibidos, bytes, t0}
+
+function log(txt, clase) {
+  const l = $('log'), d = document.createElement('div');
+  d.textContent = new Date().toLocaleTimeString() + '  ' + txt;
+  if (clase) d.className = clase;
+  l.appendChild(d); l.scrollTop = l.scrollHeight;
+}
+
+function activar(si) {
+  document.querySelectorAll('button').forEach(b => {
+    if (b.id === 'bConectar') b.disabled = si;
+    else b.disabled = !si;
+  });
+}
+
+// Un pitido hecho en la página: el sonido no viaja por BLE, solo la orden de sonar.
+let actx = null;
+function pitido(f) {
+  actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.frequency.value = f; g.gain.value = 0.08;
+  o.connect(g).connect(actx.destination);
+  o.start(); g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + 0.15);
+  o.stop(actx.currentTime + 0.16);
+}
+
+async function mandar(txt) {
+  // Bluefy (iPhone) puede no tener writeValueWithoutResponse: entonces, la de siempre.
+  if (chOrden.writeValueWithoutResponse) await chOrden.writeValueWithoutResponse(enc.encode(txt));
+  else await chOrden.writeValue(enc.encode(txt));
+}
+
+function recibido(ev) {
+  const v = ev.target.value;
+  const s = dec.decode(v);
+  switch (s[0]) {
+    case 'p':
+      if (pingEspera && s.slice(1) === String(pingEspera.n)) {
+        const ms = performance.now() - pingEspera.t0;
+        pingEspera.resolver(ms); pingEspera = null;
+      }
+      break;
+    case 'r':
+      if (rafaga) { rafaga.recibidos++; rafaga.bytes += v.byteLength; }
+      break;
+    case 'R':
+      if (rafaga) {
+        const seg = (performance.now() - rafaga.t0) / 1000;
+        const kbs = rafaga.bytes / 1024 / seg;
+        const [env, msCerebro] = s.slice(1).split(' ');
+        $('dCaudal').textContent = kbs.toFixed(1) + ' KB/s';
+        log(`Ráfaga: llegan ${rafaga.recibidos} de ${env} paquetes, ${(rafaga.bytes/1024).toFixed(1)} KB en ${seg.toFixed(2)} s (el cerebro tardó ${msCerebro} ms en mandarlos)`,
+            rafaga.recibidos == env ? 'ok' : 'err');
+        rafaga = null;
+      }
+      break;
+    case 'b': {
+      const [boton, conex] = s.slice(1).split(' ');
+      log(`El cerebro recibe el botón ${boton} (conexión ${conex})`, 'ok');
+      pitido(boton === 'A' ? 660 : boton === 'B' ? 440 : 880);
+      break;
+    }
+    case 't': {
+      const m = s.match(/c(\d+)/);
+      if (m) $('dConex').textContent = m[1];
+      break;
+    }
+    default:
+      log('Llega: ' + s);
+  }
+}
+
+$('bConectar').onclick = async () => {
+  try {
+    log('Buscando "Korum"…');
+    disp = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERV] }, { name: 'Korum' }],
+      optionalServices: [SERV],
+    });
+    disp.addEventListener('gattserverdisconnected', () => {
+      $('dEstado').textContent = 'desconectado'; activar(false);
+      log('Se ha cortado la conexión', 'err');
+    });
+    $('dEstado').textContent = 'conectando';
+    const t0 = performance.now();
+    const gatt = await disp.gatt.connect();
+    const serv = await gatt.getPrimaryService(SERV);
+    const chEstado = await serv.getCharacteristic(ESTADO);
+    chOrden = await serv.getCharacteristic(ORDEN);
+    chEstado.addEventListener('characteristicvaluechanged', recibido);
+    await chEstado.startNotifications();
+    $('dEstado').textContent = 'conectado';
+    log(`Conectado con ${disp.name || 'Korum'} en ${(performance.now() - t0).toFixed(0)} ms`, 'ok');
+    activar(true);
+  } catch (e) {
+    $('dEstado').textContent = '—';
+    log('No se pudo conectar: ' + e.message, 'err');
+  }
+};
+
+$('bDesc').onclick = () => { if (disp && disp.gatt.connected) disp.gatt.disconnect(); };
+
+$('bPing').onclick = async () => {
+  const tiempos = [];
+  for (let i = 0; i < 50; i++) {
+    const ms = await new Promise(async res => {
+      const n = Math.floor(Math.random() * 1e9);
+      pingEspera = { n, t0: performance.now(), resolver: res };
+      setTimeout(() => { if (pingEspera && pingEspera.n === n) { pingEspera = null; res(null); } }, 2000);
+      await mandar('P' + n);
+    });
+    if (ms !== null) tiempos.push(ms);
+    $('dPing').textContent = ms === null ? 'perdido' : ms.toFixed(0) + ' ms';
+  }
+  if (!tiempos.length) { log('Ningún ping volvió', 'err'); return; }
+  tiempos.sort((a, b) => a - b);
+  const media = tiempos.reduce((a, b) => a + b, 0) / tiempos.length;
+  $('dPing').textContent = media.toFixed(0) + ' ms';
+  log(`Ping: vuelven ${tiempos.length} de 50; media ${media.toFixed(0)} ms, mínimo ${tiempos[0].toFixed(0)}, máximo ${tiempos[tiempos.length - 1].toFixed(0)}`,
+      tiempos.length === 50 ? 'ok' : 'err');
+};
+
+$('bRafaga').onclick = async () => {
+  rafaga = { recibidos: 0, bytes: 0, t0: performance.now() };
+  log('Pidiendo 200 paquetes de 180 B…');
+  await mandar('R200');
+};
+
+document.querySelectorAll('button[data-b]').forEach(b => {
+  b.onclick = () => mandar('B' + b.dataset.b);
+});
+
+if (!navigator.bluetooth) {
+  $('aviso').style.display = 'block';
+  $('aviso').textContent = 'Este navegador no tiene Web Bluetooth. En Android, ábrela con Chrome; en iPhone, con la app Bluefy (Safari no sirve); en el PC, con Chrome o Edge.';
+  $('bConectar').disabled = true;
+}
+</script>
+</body>
+</html>
