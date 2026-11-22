@@ -103,17 +103,12 @@ function recibido(ev) {
       }
       break;
     case 'r':
-      if (rafaga) { rafaga.recibidos++; rafaga.bytes += v.byteLength; }
+      if (rafaga) { rafaga.recibidos++; rafaga.bytes += v.byteLength; rafaga.ultimo = performance.now(); }
       break;
     case 'R':
       if (rafaga) {
-        const seg = (performance.now() - rafaga.t0) / 1000;
-        const kbs = rafaga.bytes / 1024 / seg;
-        const [env, msCerebro] = s.slice(1).split(' ');
-        $('dCaudal').textContent = kbs.toFixed(1) + ' KB/s';
-        log(`Ráfaga: llegan ${rafaga.recibidos} de ${env} paquetes, ${(rafaga.bytes/1024).toFixed(1)} KB en ${seg.toFixed(2)} s (el cerebro tardó ${msCerebro} ms en mandarlos)`,
-            rafaga.recibidos == env ? 'ok' : 'err');
-        rafaga = null;
+        const [env, msCerebro, esperas] = s.slice(1).split(' ');
+        finRafaga(`el cerebro mandó ${env} en ${msCerebro} ms y tuvo que esperar a la cola ${esperas || '?'} veces`, env);
       }
       break;
     case 'b': {
@@ -182,8 +177,21 @@ $('bPing').onclick = async () => {
       tiempos.length === 50 ? 'ok' : 'err');
 };
 
+// Cierra la ráfaga: con el aviso del cerebro, o a los 20 s si ese aviso no llega
+// (22-nov, primera prueba en iPhone: se perdió y la página se quedó callada).
+function finRafaga(detalle, pedidos) {
+  clearTimeout(rafaga.reloj);
+  const seg = (rafaga.ultimo - rafaga.t0) / 1000 || 0.001;
+  const kbs = rafaga.bytes / 1024 / seg;
+  $('dCaudal').textContent = rafaga.bytes ? kbs.toFixed(1) + ' KB/s' : 'nada';
+  log(`Ráfaga: llegan ${rafaga.recibidos} de ${pedidos} paquetes, ${(rafaga.bytes/1024).toFixed(1)} KB en ${seg.toFixed(2)} s; ${detalle}`,
+      rafaga.recibidos == pedidos ? 'ok' : 'err');
+  rafaga = null;
+}
+
 $('bRafaga').onclick = async () => {
-  rafaga = { recibidos: 0, bytes: 0, t0: performance.now() };
+  rafaga = { recibidos: 0, bytes: 0, t0: performance.now(), ultimo: performance.now() };
+  rafaga.reloj = setTimeout(() => { if (rafaga) finRafaga('el aviso de fin no llegó', 200); }, 20000);
   log('Pidiendo 200 paquetes de 180 B…');
   await mandar('R200');
 };
